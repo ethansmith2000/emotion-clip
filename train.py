@@ -35,12 +35,11 @@ from transformers import AutoModel, CLIPVisionModelWithProjection
 import pandas as pd
 
 default_args = {
-    "train_file": "250kimages_train.csv",
-    "validation_file": "250kimages_test.csv",
-    "max_length": 512,
-    "model_name_or_path": "openai/clip-vit-base-patch32",
-    "per_device_train_batch_size": 1024,
-    "per_device_eval_batch_size": 1024,
+    "train_file": "train.csv",
+    "validation_file": "test.csv",
+    "model_name_or_path": "openai/clip-vit-large-patch14",
+    "per_device_train_batch_size": 64,
+    "per_device_eval_batch_size": 64,
     "learning_rate": 2.0e-4,
     "eval_steps": 25,
     "weight_decay": 0.01,
@@ -63,53 +62,54 @@ default_args = {
     "max_grad_norm": 1.0,
     "do_validation": True,
     "disable_wandb": False,
-    "num_vision_model_layers_trainable": 3,
+    "num_transformer_layers": 2,
     "act_fn": "none",
     "save_every":150,
-
-    "attention_probs_dropout_prob": 0.1,
-    "hidden_dropout_prob": 0.1,
+"fit_method":"pad",
+    "num_cutouts":0,
+    "image_folder": "./iaps_images",
+    "num_workers":8,
 }
 
 
-def step_forward(model, pixel_values, accelerator):
-    hidden_states = model.embeddings(pixel_values)
-    hidden_states = model.pre_layrnorm(hidden_states)
-
-    causal_attention_mask = None
-    attention_mask=None
-    output_attentions=False
-
-    for idx, encoder_layer in enumerate(model.vision_mode.encoder.layers):
-
-        if idx == len(model.encoder.layers) - args.num_vision_model_layers_trainable:
-            hidden_states = hidden_states.to(torch.float32).requires_grad_(True)
-
-        if model.gradient_checkpointing and model.training:
-
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(*inputs, output_attentions)
-
-                return custom_forward
-
-            layer_outputs = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(encoder_layer),
-                hidden_states,
-                attention_mask,
-                causal_attention_mask,
-            )
-        else:
-            layer_outputs = encoder_layer(
-                hidden_states,
-                attention_mask,
-                causal_attention_mask,
-            )
-
-        hidden_states = layer_outputs[0]
-
-
-    return hidden_states
+# def step_forward(model, pixel_values, accelerator):
+#     hidden_states = model.embeddings(pixel_values)
+#     hidden_states = model.pre_layrnorm(hidden_states)
+#
+#     causal_attention_mask = None
+#     attention_mask=None
+#     output_attentions=False
+#
+#     for idx, encoder_layer in enumerate(model.vision_mode.encoder.layers):
+#
+#         if idx == len(model.encoder.layers) - args.num_vision_model_layers_trainable:
+#             hidden_states = hidden_states.to(torch.float32).requires_grad_(True)
+#
+#         if model.gradient_checkpointing and model.training:
+#
+#             def create_custom_forward(module):
+#                 def custom_forward(*inputs):
+#                     return module(*inputs, output_attentions)
+#
+#                 return custom_forward
+#
+#             layer_outputs = torch.utils.checkpoint.checkpoint(
+#                 create_custom_forward(encoder_layer),
+#                 hidden_states,
+#                 attention_mask,
+#                 causal_attention_mask,
+#             )
+#         else:
+#             layer_outputs = encoder_layer(
+#                 hidden_states,
+#                 attention_mask,
+#                 causal_attention_mask,
+#             )
+#
+#         hidden_states = layer_outputs[0]
+#
+#
+#     return hidden_states
 
 
 def main(args):
@@ -148,76 +148,49 @@ def main(args):
     train_df = pd.read_csv(args.train_file)
     eval_df = pd.read_csv(args.validation_file)
 
-    train_dataset = ImageDataset(train_df, fit_method=args.fit_method, num_cutouts=args.num_cutouts, is_clip=True)
-    eval_dataset = ImageDataset(eval_df, fit_method=args.fit_method, num_cutouts=args.num_cutouts, is_clip=True)
+    train_dataset = ImageDataset(args.image_folder, train_df, fit_method=args.fit_method, num_cutouts=args.num_cutouts, is_clip=True)
+    eval_dataset = ImageDataset(args.image_folder, eval_df, fit_method=args.fit_method, num_cutouts=args.num_cutouts, is_clip=True)
 
-    # Load pretrained model and tokenizer
-    config = AutoConfig.from_pretrained(args.model_name_or_path)
-    config.attention_probs_dropout_prob = args.attention_probs_dropout_prob
-    config.hidden_dropout_prob = args.hidden_dropout_prob
+    # Load pretrained model
+    model = CLIPVisionModelWithProjection.from_pretrained(args.model_name_or_path).to(accelerator.device).to(weight_dtype)
 
-    model = CLIPVisionModelWithProjection.from_pretrained(args.model_name_or_path,config=config,).to(accelerator.device).to(weight_dtype)
-
-    classifier = Network(out_dim=args.hidden_dim, act_fn=args.act_fn)
+    classifier = Network(in_dim=1024, out_dim=args.hidden_dim, act_fn=args.act_fn, num_transformer_layers=args.num_transformer_layers)
     criterion = nn.MSELoss()
 
     def collate_fn(examples):
-        collated = {k: torch.stack([example[k] for example in examples]) for k in examples.keys()}
+        keys = examples[0].keys()
+        collated = {k: torch.stack([example[k] for example in examples]) for k in keys}
         return collated
 
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.per_device_train_batch_size
+        train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.per_device_train_batch_size,
+        num_workers=args.num_workers
     )
     eval_dataloader = DataLoader(eval_dataset, shuffle=True, collate_fn=collate_fn,
+                                 num_workers=args.num_workers,
                                  batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in classifier.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in classifier.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    if args.num_vision_model_layers_trainable > 0:
-        vision_model_params = {}
-        for name_orig, param in model.named_parameters():
-            name = name_orig.split('.')
-            if name[0] == 'encoder' and name[1] == 'layer':
-                if int(name[2]) >= len(model.encoder.layer) - args.num_bert_layers_trainable:
-                    vision_model_params[name_orig] = param
 
-        optimizer_grouped_parameters.append(
-        {
-            "params": [p for n, p in vision_model_params.items() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        }
-        )
-        optimizer_grouped_parameters.append(
-        {
-            "params": [p for n, p in vision_model_params.items() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-        )
+    # no_decay = ["bias", "LayerNorm.weight"]
+    # optimizer_grouped_parameters = [
+    #     {
+    #         "params": [p for n, p in classifier.named_parameters() if not any(nd in n for nd in no_decay)],
+    #         "weight_decay": args.weight_decay,
+    #     },
+    #     {
+    #         "params": [p for n, p in classifier.named_parameters() if any(nd in n for nd in no_decay)],
+    #         "weight_decay": 0.0,
+    #     },
+    # ]
 
-        model.requires_grad_(False)
-        for layer in model.encoder.layer[-args.num_bert_layers_trainable:]:
-            layer.requires_grad_(True)
-            layer.to(accelerator.device).to(torch.float32)
-        for n, p in model.named_parameters():
-            if "pooler" in n:
-                p.requires_grad_(True)
+    trainable_params = [*classifier.parameters()]
 
-    else:
-        model.requires_grad_(False)
-        classifier.requires_grad_(True)
+    model.requires_grad_(False)
+    classifier.requires_grad_(True)
 
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -234,7 +207,7 @@ def main(args):
     )
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        classifier.enable_gradient_checkpointing()
 
     # Prepare everything with our `accelerator`.
     model, optimizer, classifier, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
@@ -258,7 +231,7 @@ def main(args):
     if args.with_tracking and not args.disable_wandb:
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
-        accelerator.init_trackers("bert_nsfw_classification", experiment_config)
+        accelerator.init_trackers("emotion-clip", experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -299,11 +272,11 @@ def main(args):
             resume_step -= starting_epoch * len(train_dataloader)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
+        model.eval()
         classifier.train()
         total_loss = 0
         for step, batch in enumerate(train_dataloader):
-            model.train()
+            model.eval()
             classifier.train()
             # We need to skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == starting_epoch:
@@ -314,10 +287,18 @@ def main(args):
             pixel_values = batch['pixel_values'].cuda()
             score = batch['score'].cuda()
 
-            hidden_states = step_forward(model, pixel_values, accelerator)
+            hidden_states = model(pixel_values, output_hidden_states=True).hidden_states[-2]
 
-            logits = classifier(hidden_states).squeeze()
-            loss = criterion(logits.float(), score.float())
+            #valence_pred, arousal_pred, dominance_pred, dominance_2_pred = classifier(hidden_states).squeeze()
+            valence_pred, arousal_pred = classifier(hidden_states)
+
+            valence_loss = criterion(valence_pred.float(), score[:, 0:1].float())
+            arousal_loss = criterion(arousal_pred.float(), score[:, 1:2].float())
+            # dominance_loss = criterion(dominance_pred.float(), score[:, 2:3].float())
+            # dominance_2_loss = criterion(dominance_2_pred.float(), score[:, 3:4].float())
+
+            #loss = (valence_loss + arousal_loss + dominance_loss + dominance_2_loss) / 4
+            loss = (valence_loss + arousal_loss) / 2
 
             loss = loss.mean()
 
@@ -327,11 +308,7 @@ def main(args):
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                params_to_clip = (
-                    itertools.chain(model.parameters(), classifier.parameters()) if args.num_vision_model_layers_trainable > 0
-                    else classifier.parameters()
-                )
-                grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                grad_norm = accelerator.clip_grad_norm_(classifier.parameters(), args.max_grad_norm)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
 
                 optimizer.step()
@@ -341,7 +318,14 @@ def main(args):
                 completed_steps += 1
 
                 accelerator.log(
-                    {"train_loss": loss.detach().float().item(), "epoch": epoch, "total_norm": grad_norm},
+                    {"train_loss": loss.detach().float().item(),
+                     "epoch": epoch,
+                     "total_norm": grad_norm,
+                     "valence_loss": valence_loss.mean().item(),
+                        "arousal_loss": arousal_loss.mean().item(),
+                        # "dominance_loss": dominance_loss.mean().item(),
+                        # "dominance_2_loss": dominance_2_loss.mean().item(),
+                     },
                     step=completed_steps, )
                 accelerator.log({"lr": lr_scheduler.get_last_lr()[0]}, step=completed_steps)
 
@@ -356,10 +340,18 @@ def main(args):
                     pixel_values = batch['pixel_values'].cuda()
                     score = batch['score'].cuda()
 
-                    hidden_states = step_forward(model, pixel_values, accelerator)
+                    hidden_states = model(pixel_values, output_hidden_states=True).hidden_states[-2]
 
-                    logits = classifier(hidden_states).squeeze()
-                    eval_loss = criterion(logits.float(), score.float()).detach().float()
+                    # valence_pred, arousal_pred, dominance_pred, dominance_2_pred = classifier(hidden_states).squeeze()
+                    valence_pred, arousal_pred = classifier(hidden_states)
+
+                    valence_loss = criterion(valence_pred.float(), score[:, 0:1].float())
+                    arousal_loss = criterion(arousal_pred.float(), score[:, 1:2].float())
+                    # dominance_loss = criterion(dominance_pred.float(), score[:, 2:3].float())
+                    # dominance_2_loss = criterion(dominance_2_pred.float(), score[:, 3:4].float())
+
+                    # loss = (valence_loss + arousal_loss + dominance_loss + dominance_2_loss) / 4
+                    eval_loss = (valence_loss + arousal_loss) / 2
 
                     eval_loss = eval_loss.mean().item()
 
@@ -370,6 +362,10 @@ def main(args):
                     accelerator.log(
                         {
                             "eval_loss": eval_loss,
+                            "eval_valence_loss": valence_loss.mean().item(),
+                            "eval_arousal_loss": arousal_loss.mean().item(),
+                            # "eval_dominance_loss": dominance_loss.mean().item(),
+                            # "eval_dominance_2_loss": dominance_2_loss.mean().item(),
                         },
                         step=completed_steps,
                     )
@@ -377,10 +373,6 @@ def main(args):
 
             if completed_steps % args.save_every == 0 and completed_steps > 1:
                 state_dict = {}
-                if args.num_vision_model_layers_trainable > 0:
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    state_dict['vision_model'] = unwrapped_model.state_dict()
-
                 classifier = accelerator.unwrap_model(classifier)
                 state_dict["classifier"] = classifier.state_dict()
                 state_dict["act_fn"] = args.act_fn
@@ -400,10 +392,6 @@ def main(args):
 
     accelerator.wait_for_everyone()
     state_dict = {}
-    if args.num_vision_model_layers_trainable > 0:
-        unwrapped_model = accelerator.unwrap_model(model)
-        state_dict['vision_model'] = unwrapped_model.state_dict()
-
     classifier = accelerator.unwrap_model(classifier)
     state_dict["classifier"] = classifier.state_dict()
     state_dict["act_fn"] = args.act_fn

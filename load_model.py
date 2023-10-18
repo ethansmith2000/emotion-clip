@@ -58,11 +58,10 @@ def load_model(model_path, device="cuda", dtype=torch.float16):
         input_dim = state_dict["classifier"]['linear.weight'].shape[1]
     else:
         input_dim = state_dict["classifier"]['classifier.weight'].shape[1]
+
     classifier = Network(in_dim=input_dim,out_dim=hidden_dim, act_fn=state_dict["act_fn"]).to(device).to(dtype)
     classifier.load_state_dict(state_dict["classifier"])
 
-    if "vision_model" in state_dict.keys():
-        model.load_state_dict(state_dict["vision_model"])
 
     model = EmotionClassifier(model, classifier, num_cutouts=state_dict["num_cutouts"], fit_method=state_dict["fit_method"])
     model = model.to(device).to(dtype)
