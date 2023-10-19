@@ -11,6 +11,8 @@ import xformers
 import xformers.ops as xops
 from torch import nn
 
+import random
+
 
 class Attention(nn.Module):
     def __init__(self, query_dim=768, context_dim=1024,
@@ -101,11 +103,11 @@ class TransformerLayer(nn.Module):
                  use_xformers=True, ff_mult=4, use_cross_attn=False):
 
         super().__init__()
-        self.self_attn = Attention(query_dim=query_dim,
-                 context_dim=context_dim,
-                 heads=heads,
-                 dropout=dropout,
-                 use_xformers=use_xformers,)
+        # self.self_attn = Attention(query_dim=query_dim,
+        #          context_dim=context_dim,
+        #          heads=heads,
+        #          dropout=dropout,
+        #          use_xformers=use_xformers,)
         if use_cross_attn:
             self.cross_attn = Attention(query_dim=query_dim,
                     context_dim=context_dim,
@@ -115,21 +117,21 @@ class TransformerLayer(nn.Module):
         else:
             self.cross_attn = None
 
-        self.ff = FeedForward(query_dim, mult=ff_mult, dropout=dropout)
+        # self.ff = FeedForward(query_dim, mult=ff_mult, dropout=dropout)
         self.gradient_checkpointing = False
 
     def forward(self, x, context):
         if self.gradient_checkpointing:
-            x = torch.utils.checkpoint.checkpoint(self.self_attn, x, x)
+            #x = torch.utils.checkpoint.checkpoint(self.self_attn, x, x)
             if self.cross_attn is not None:
                 x = torch.utils.checkpoint.checkpoint(self.cross_attn, x, context)
-            x = torch.utils.checkpoint.checkpoint(self.ff, x)
+            #x = torch.utils.checkpoint.checkpoint(self.ff, x)
 
         else:
-            x = self.self_attn(x, x)
+            #x = self.self_attn(x, x)
             if self.cross_attn is not None:
                 x = self.cross_attn(x, context)
-            x = self.ff(x)
+            #x = self.ff(x)
 
         return x
 
@@ -149,9 +151,15 @@ def gaussian(M, std, sym=True):
         w = w[:-1]
     return w
 
-def preprocess_image(image, fit_method="pad",num_cutouts=5, is_clip=True):
+def preprocess_image(image, fit_method="pad",num_cutouts=5, is_clip=True, color_jitter=0.1):
+
+    if isinstance(fit_method, list):
+        fit_method = random.choice(fit_method)
+
     transforms = [
         T.Resize(224),
+        T.ColorJitter(brightness=color_jitter, contrast=color_jitter, saturation=color_jitter, hue=color_jitter),
+        T.RandomHorizontalFlip(),
         T.ToTensor(),
     ]
     if is_clip:
@@ -209,7 +217,7 @@ def sliding_cutouts(tensor, num_cuts=5, cut_size=224):
 
 
 class Network(nn.Module):
-    def __init__(self, in_dim=768, out_dim=384, act_fn="silu", pre_layernorm=True, num_transformer_layers=3, num_queries=2):
+    def __init__(self, input_dim=1024, hidden_dim=384, act_fn="silu", pre_layernorm=True, num_transformer_layers=3, num_queries=2, ff_mult=2):
         super().__init__()
 
         if "silu" in act_fn.lower():
@@ -224,12 +232,12 @@ class Network(nn.Module):
 
 
         if num_transformer_layers > 0:
-            self.transformer_layers = nn.ModuleList([TransformerLayer(query_dim=in_dim, context_dim=in_dim, use_cross_attn=True) for _ in range(num_transformer_layers)])
-            self.learned_queries = nn.Parameter(torch.randn(num_queries, in_dim) * 0.02)
+            self.transformer_layers = nn.ModuleList([TransformerLayer(query_dim=hidden_dim, context_dim=hidden_dim, use_cross_attn=True, ff_mult=ff_mult) for _ in range(num_transformer_layers)])
+            self.learned_queries = nn.Parameter(torch.randn(num_queries, hidden_dim) * 0.02)
 
             if pre_layernorm:
-                self.proj_in = nn.Linear(in_dim, in_dim)
-                self.layer_norm = nn.LayerNorm(in_dim)
+                self.proj_in = nn.Linear(input_dim, hidden_dim)
+                self.layer_norm = nn.LayerNorm(hidden_dim)
             else:
                 self.layer_norm = None
                 self.proj_in = None
@@ -248,8 +256,8 @@ class Network(nn.Module):
                     nn.Linear(_out_dim, 1),
                 )
 
-        self.valence_classifier = make_classifier(in_dim, out_dim, act_fn)
-        self.arousal_classifier = make_classifier(in_dim, out_dim, act_fn)
+        self.valence_classifier = make_classifier(hidden_dim, hidden_dim, act_fn)
+        self.arousal_classifier = make_classifier(hidden_dim, hidden_dim, act_fn)
         # self.dominance_classifier = make_classifier(in_dim, out_dim, act_fn)
         # self.dominance_2_classifier = make_classifier(in_dim, out_dim, act_fn)
 

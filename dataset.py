@@ -7,7 +7,7 @@ import torch
 
 
 class ImageDataset(Dataset):
-    def __init__(self, image_folder, df, fit_method, num_cutouts=0, is_clip=True, image_col_name="IAPS"):
+    def __init__(self, image_folder, df, fit_method, num_cutouts=0, is_clip=True, image_col_name="IAPS", color_jitter=0.1):
         self.image_paths = df[f"{image_col_name}"].tolist()
         self.image_paths = [str(p).replace(".0","") + ".jpg" for p in self.image_paths]
         self.image_paths = [os.path.join(image_folder, p) for p in self.image_paths]
@@ -26,6 +26,7 @@ class ImageDataset(Dataset):
         self.processor = preprocess_image
         self.num_cutouts = num_cutouts
         self.is_clip = is_clip
+        self.color_jitter = color_jitter
 
         random.shuffle(self.image_paths)
 
@@ -42,7 +43,7 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, idx):
         img, idx = self.try_to_get_image(idx)
-        img_tensor = self.processor(img, self.fit_method, num_cutouts=self.num_cutouts, is_clip=self.is_clip)
+        img_tensor = self.processor(img, self.fit_method, num_cutouts=self.num_cutouts, is_clip=self.is_clip, color_jitter=self.color_jitter)
 
         valence_score = self.valence_scores[idx]
         arousal_score = self.arousal_scores[idx]

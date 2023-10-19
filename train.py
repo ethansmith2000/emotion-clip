@@ -62,13 +62,14 @@ default_args = {
     "max_grad_norm": 1.0,
     "do_validation": True,
     "disable_wandb": False,
-    "num_transformer_layers": 2,
+    "num_transformer_layers": 1,
     "act_fn": "none",
     "save_every":150,
-"fit_method":"pad",
+    "fit_method":["pad", "resize", "center"],
     "num_cutouts":0,
     "image_folder": "./iaps_images",
     "num_workers":8,
+    "color_jitter": 0.15,
 }
 
 
@@ -154,7 +155,7 @@ def main(args):
     # Load pretrained model
     model = CLIPVisionModelWithProjection.from_pretrained(args.model_name_or_path).to(accelerator.device).to(weight_dtype)
 
-    classifier = Network(in_dim=1024, out_dim=args.hidden_dim, act_fn=args.act_fn, num_transformer_layers=args.num_transformer_layers)
+    classifier = Network(input_dim=1024, hidden_dim=args.hidden_dim, act_fn=args.act_fn, num_transformer_layers=args.num_transformer_layers)
     criterion = nn.MSELoss()
 
     def collate_fn(examples):
